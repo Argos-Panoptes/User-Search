@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env
+logs/
+.git/
+.gitignore
+.dockerignore
+docker-compose.yml
+docker-compose-dev.yml
+nginx.conf
+export_data/
+temp_uploads/
+uploads/

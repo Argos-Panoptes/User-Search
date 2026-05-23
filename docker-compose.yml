@@ -1,0 +1,443 @@
+services:
+  # Main Entry Point (Reverse Proxy)
+  nginx:
+    image: nginx:latest
+    container_name: user-search-gateway
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - frontend_build:/usr/share/nginx/html/app:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-/app/api/v1}
+        - VITE_ENABLE_AUTH=${VITE_ENABLE_AUTH:-true}
+        - VITE_LOGOUT_URL=${VITE_LOGOUT_URL:-/app/logout}
+        - VITE_CHECK_AUTH_URL=${VITE_CHECK_AUTH_URL:-/app/api/v1/auth/check-auth}
+        - VITE_LOGIN_URL=${VITE_LOGIN_URL:-/login}
+    container_name: user-search-frontend
+    volumes:
+      - frontend_build:/usr/share/nginx/html
+    restart: always
+    networks:
+      - user-search-net
+
+  auth:
+    build:
+      context: ./auth
+      dockerfile: Dockerfile
+    container_name: user-search-auth
+    ports:
+      - "9000:9000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - BETTER_AUTH_URL=${BETTER_AUTH_URL}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - FRONTEND_URL=${FRONTEND_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/health" ]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks:
+      - user-search-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-backend
+    env_file:
+      - .env
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME}
+      - API_V1_STR=${API_V1_STR}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-5}
+      - OPENSEARCH_URL=${OPENSEARCH_URL:-http://opensearch:9200}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672//
+      - ENABLE_AUTH=${ENABLE_AUTH:-true}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - ALGORITHM=${ALGORITHM:-HS256}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES}
+      - AUTH_COOKIE_NAME=${AUTH_COOKIE_NAME}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - BETTER_AUTH_URL=${BETTER_AUTH_URL}
+      - SPARK_MASTER_URL=${SPARK_MASTER_URL:-spark://spark-master:7077}
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+      - UPLOAD_TEMP_DIR_NAME=${UPLOAD_TEMP_DIR_NAME}
+      - UPLOAD_FINAL_DIR_NAME=${UPLOAD_FINAL_DIR_NAME}
+      - STRIPE_API_KEY=${STRIPE_API_KEY}
+      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - STRIPE_PRICE_ID=${STRIPE_PRICE_ID}
+      - STRIPE_TRIAL_PERIOD_DAYS=${STRIPE_TRIAL_PERIOD_DAYS}
+      - ADMIN_EMAIL_DOMAIN=${ADMIN_EMAIL_DOMAIN}
+      - LINK_RECONSTRUCTION_INTERVAL_MINUTES=${LINK_RECONSTRUCTION_INTERVAL_MINUTES:-15}
+      - WHITELISTED_DOMAINS=${WHITELISTED_DOMAINS}
+      - FRONTEND_URL=${FRONTEND_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+    volumes:
+      - ./backend/app:/app/app
+      - ./export_data:/export_data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-beat
+    command: celery -A app.core.celery_app beat --loglevel=info
+    env_file:
+      - .env
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672//
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+      - LINK_RECONSTRUCTION_INTERVAL_MINUTES=${LINK_RECONSTRUCTION_INTERVAL_MINUTES:-15}
+      - WHITELISTED_DOMAINS=${WHITELISTED_DOMAINS}
+    depends_on:
+      backend:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  celery_worker_users:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-worker-users
+    command: celery -A app.core.celery_app worker --loglevel=info -Q users --concurrency=1 --logfile=/app/logs/celery_worker_users.log -n worker_users@%h
+    env_file:
+      - .env
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672//
+      - SPARK_MASTER_URL=${SPARK_MASTER_URL:-spark://spark-master:7077}
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+      - ADMIN_EMAIL_DOMAIN=${ADMIN_EMAIL_DOMAIN}
+      - LINK_RECONSTRUCTION_INTERVAL_MINUTES=${LINK_RECONSTRUCTION_INTERVAL_MINUTES:-15}
+      - WHITELISTED_DOMAINS=${WHITELISTED_DOMAINS}
+    depends_on:
+      backend:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./backend/app:/app/app
+      - ./export_data:/export_data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  celery_worker_groups:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-worker-groups
+    command: celery -A app.core.celery_app worker --loglevel=info -Q groups --concurrency=1 --logfile=/app/logs/celery_worker_groups.log -n worker_groups@%h
+    env_file:
+      - .env
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672//
+      - SPARK_MASTER_URL=${SPARK_MASTER_URL:-spark://spark-master:7077}
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+      - ADMIN_EMAIL_DOMAIN=${ADMIN_EMAIL_DOMAIN}
+      - LINK_RECONSTRUCTION_INTERVAL_MINUTES=${LINK_RECONSTRUCTION_INTERVAL_MINUTES:-15}
+      - WHITELISTED_DOMAINS=${WHITELISTED_DOMAINS}
+    depends_on:
+      backend:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./backend/app:/app/app
+      - ./export_data:/export_data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  celery_worker_avatars:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-worker-avatars
+    command: celery -A app.core.celery_app worker --loglevel=info -Q avatars --concurrency=1 --logfile=/app/logs/celery_worker_avatars.log -n worker_avatars@%h
+    env_file:
+      - .env
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672//
+      - SPARK_MASTER_URL=${SPARK_MASTER_URL:-spark://spark-master:7077}
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+      - ADMIN_EMAIL_DOMAIN=${ADMIN_EMAIL_DOMAIN}
+      - LINK_RECONSTRUCTION_INTERVAL_MINUTES=${LINK_RECONSTRUCTION_INTERVAL_MINUTES:-15}
+      - WHITELISTED_DOMAINS=${WHITELISTED_DOMAINS}
+    depends_on:
+      backend:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./backend/app:/app/app
+      - ./export_data:/export_data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  celery_worker_default:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-worker-default
+    command: celery -A app.core.celery_app worker --loglevel=info -Q ingestion,celery,reconstruction --logfile=/app/logs/celery_worker_default.log -n worker_default@%h
+    env_file:
+      - .env
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-user_search}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672//
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+      - ADMIN_EMAIL_DOMAIN=${ADMIN_EMAIL_DOMAIN}
+      - LINK_RECONSTRUCTION_INTERVAL_MINUTES=${LINK_RECONSTRUCTION_INTERVAL_MINUTES:-15}
+      - WHITELISTED_DOMAINS=${WHITELISTED_DOMAINS}
+    depends_on:
+      backend:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./backend/app:/app/app
+      - ./export_data:/export_data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: user-search-flower
+    command: celery -A app.core.celery_app flower --port=5555 --persistent=True --db=/data/flower.db --url_prefix=app/flower --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    env_file:
+      - .env
+    volumes:
+      - flower_data:/data
+      - ./logs:/app/logs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      celery_worker_default:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  db:
+    image: postgres:18-alpine
+    container_name: user-search-db
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-user_search}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-user_search}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - user-search-net
+
+  opensearch:
+    image: opensearchproject/opensearch:3
+    container_name: user-search-opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearchdata:/usr/share/opensearch/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9200/_cluster/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - user-search-net
+
+  # opensearch-dashboards:
+  #   image: opensearchproject/opensearch-dashboards:3
+  #   container_name: user-search-dashboards
+  #   ports:
+  #     - "5601:5601"
+  #   environment:
+  #     OPENSEARCH_HOSTS: '["${OPENSEARCH_URL:-http://opensearch:9200}"]'
+  #     DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+  #   depends_on:
+  #     - opensearch
+  #   networks:
+  #     - user-search-net
+
+  redis:
+    image: redis:8-alpine
+    container_name: user-search-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - user-search-net
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: user-search-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-guest}
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - user-search-net
+
+  spark-master:
+    image: apache/spark:4.1.1
+    container_name: user-search-spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_WORKER_MEMORY=1G
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./export_data:/export_data
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+  spark-worker:
+    image: apache/spark:4.1.1
+    container_name: user-search-spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - EXPORT_DATA_DIR=${EXPORT_DATA_DIR:-/export_data}
+    volumes:
+      - ./export_data:/export_data
+    depends_on:
+      - spark-master
+    restart: unless-stopped
+    networks:
+      - user-search-net
+
+volumes:
+  pgdata:
+  opensearchdata:
+  flower_data:
+  frontend_build:
+
+
+networks:
+  user-search-net:
+    driver: bridge
